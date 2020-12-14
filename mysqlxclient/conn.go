@@ -1,37 +1,176 @@
 package mysqlxclient
 
 import (
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
 	"time"
+
+	"github.com/golang/protobuf/proto"
+	"github.com/ldeng7/go-mysqlx-client/mysqlxpb"
+	"github.com/ldeng7/go-mysqlx-client/mysqlxpb/mysqlxpb_connection"
+	"github.com/ldeng7/go-mysqlx-client/mysqlxpb/mysqlxpb_notice"
+	"github.com/ldeng7/go-mysqlx-client/mysqlxpb/mysqlxpb_resultset"
+	"github.com/ldeng7/go-mysqlx-client/mysqlxpb/mysqlxpb_session"
+	"github.com/ldeng7/go-mysqlx-client/mysqlxpb/mysqlxpb_sql"
 )
+
+var errMysqlInvalidMessage = errors.New("invalid data from mysql")
+
+type messenger struct {
+	pc *poolConn
+}
+
+func (m *messenger) sendMsg(typ mysqlxpb.ClientMessages_Type, msg proto.Message) error {
+	payload, err := proto.Marshal(msg)
+	if nil != err {
+		return err
+	}
+
+	bs := make([]byte, 5+len(payload))
+	binary.LittleEndian.PutUint32(bs, uint32(len(payload))+1)
+	bs[4] = byte(typ)
+	copy(bs[5:], payload)
+
+	return m.pc.sendFull(bs)
+}
+
+func (m *messenger) recvPayload() (mysqlxpb.ServerMessages_Type, []byte, error) {
+	bs := make([]byte, 5)
+	if err := m.pc.recvFull(bs); nil != err {
+		return 0, nil, err
+	}
+
+	typ := mysqlxpb.ServerMessages_Type(bs[4])
+	payload := make([]byte, binary.LittleEndian.Uint32(bs)-1)
+	if err := m.pc.recvFull(payload); nil != err {
+		return 0, nil, err
+	}
+
+	return typ, payload, nil
+}
+
+func (m *messenger) parsePayload(typ mysqlxpb.ServerMessages_Type, payload []byte) (proto.Message, error) {
+	var msg proto.Message
+	switch typ {
+	case mysqlxpb.ServerMessages_OK:
+		msg = &mysqlxpb.Ok{}
+	case mysqlxpb.ServerMessages_ERROR:
+		msg = &mysqlxpb.Error{}
+	case mysqlxpb.ServerMessages_CONN_CAPABILITIES:
+		msg = &mysqlxpb_connection.Capabilities{}
+	case mysqlxpb.ServerMessages_SESS_AUTHENTICATE_CONTINUE:
+		msg = &mysqlxpb_session.AuthenticateContinue{}
+	case mysqlxpb.ServerMessages_SESS_AUTHENTICATE_OK:
+		msg = &mysqlxpb_session.AuthenticateOk{}
+	case mysqlxpb.ServerMessages_NOTICE:
+		msg = &mysqlxpb_notice.Frame{}
+	case mysqlxpb.ServerMessages_RESULTSET_COLUMN_META_DATA:
+		msg = &mysqlxpb_resultset.ColumnMetaData{}
+	case mysqlxpb.ServerMessages_RESULTSET_ROW:
+		msg = &mysqlxpb_resultset.Row{}
+	case mysqlxpb.ServerMessages_RESULTSET_FETCH_DONE:
+		msg = &mysqlxpb_resultset.FetchDone{}
+	case mysqlxpb.ServerMessages_RESULTSET_FETCH_SUSPENDED:
+		msg = &mysqlxpb_resultset.FetchSuspended{}
+	case mysqlxpb.ServerMessages_RESULTSET_FETCH_DONE_MORE_RESULTSETS:
+		msg = &mysqlxpb_resultset.FetchDoneMoreResultsets{}
+	case mysqlxpb.ServerMessages_SQL_STMT_EXECUTE_OK:
+		msg = &mysqlxpb_sql.StmtExecuteOk{}
+	case mysqlxpb.ServerMessages_RESULTSET_FETCH_DONE_MORE_OUT_PARAMS:
+		msg = &mysqlxpb_resultset.FetchDoneMoreOutParams{}
+	case mysqlxpb.ServerMessages_COMPRESSION:
+		msg = &mysqlxpb_connection.Compression{}
+	default:
+		return nil, errMysqlInvalidMessage
+	}
+	if err := proto.Unmarshal(payload, msg); nil != err {
+		return nil, err
+	}
+	return msg, nil
+}
+
+func (m *messenger) recvMsgUntilTypes(
+	types ...mysqlxpb.ServerMessages_Type) (proto.Message, mysqlxpb.ServerMessages_Type, error) {
+	var typeSet uint32
+	for _, t := range types {
+		typeSet |= (1 << t)
+	}
+
+	for {
+		t, payload, err := m.recvPayload()
+		if nil != err {
+			return nil, 0, err
+		}
+		//println("recv type", mysqlxpb.ServerMessages_Type_name[int32(t)]) // TODO: log it
+
+		if ((1 << t) & typeSet) != 0 {
+			msg, err := m.parsePayload(t, payload)
+			if nil != err {
+				return nil, 0, err
+			}
+			return msg, t, nil
+		}
+		switch t {
+		case mysqlxpb.ServerMessages_NOTICE:
+			if false { // FIXME: for dev only
+				m.printNotice(payload)
+			}
+		case mysqlxpb.ServerMessages_ERROR:
+			msg, err := m.parsePayload(mysqlxpb.ServerMessages_ERROR, payload)
+			if nil != err {
+				return nil, 0, err
+			}
+			e := msg.(*mysqlxpb.Error)
+			return nil, 0, &MysqlError{e.GetCode(), e.GetMsg()}
+		}
+	}
+}
 
 type poolConn struct {
 	conn     net.Conn
-	p        *pool
 	m        *messenger
+	cfg      *ClientCfg
 	broken   bool
 	lastUsed time.Time
 }
 
-func newPoolConn(conn net.Conn, pool *pool) (*poolConn, error) {
-	c := &poolConn{conn: conn, p: pool, lastUsed: time.Now()}
-	c.m = &messenger{c}
-	if err := c.auth(); nil != err {
-		return nil, errors.New("authentication error: " + err.Error())
+func newPoolConn(cfg *ClientCfg) (*poolConn, error) {
+	conn, err := net.DialTimeout("tcp", cfg.Addr, cfg.DialTimeout)
+	if nil != err {
+		return nil, err
 	}
-	return c, nil
+	defer func() {
+		if nil != err {
+			conn.Close()
+		}
+	}()
+
+	tc, _ := conn.(*net.TCPConn)
+	tc.SetKeepAlive(true) // TODO: log the error
+	if nil != cfg.OnTCPDial {
+		if err = cfg.OnTCPDial(tc); nil != err {
+			return nil, err
+		}
+	}
+
+	pc := &poolConn{conn: conn, cfg: cfg, lastUsed: time.Now()}
+	pc.m = &messenger{pc}
+	if err = pc.negotiate(); nil != err {
+		return nil, err
+	}
+	return pc, nil
 }
 
-func (c *poolConn) sendFull(bs []byte) error {
+func (pc *poolConn) sendFull(bs []byte) error {
 	for {
-		if timeout := c.p.cfg.WriteTimeout; timeout > 0 {
-			if err := c.conn.SetWriteDeadline(time.Now().Add(timeout)); nil != err {
+		if timeout := pc.cfg.WriteTimeout; timeout > 0 {
+			if err := pc.conn.SetWriteDeadline(time.Now().Add(timeout)); nil != err {
 				return err
 			}
 		}
-		n, err := c.conn.Write(bs)
+		n, err := pc.conn.Write(bs)
 		if nil != err {
 			return err
 		}
@@ -42,14 +181,14 @@ func (c *poolConn) sendFull(bs []byte) error {
 	}
 }
 
-func (c *poolConn) recvFull(bs []byte) error {
+func (pc *poolConn) recvFull(bs []byte) error {
 	for {
-		if timeout := c.p.cfg.ReadTimeout; timeout > 0 {
-			if err := c.conn.SetReadDeadline(time.Now().Add(timeout)); nil != err {
+		if timeout := pc.cfg.ReadTimeout; timeout > 0 {
+			if err := pc.conn.SetReadDeadline(time.Now().Add(timeout)); nil != err {
 				return err
 			}
 		}
-		n, err := c.conn.Read(bs)
+		n, err := pc.conn.Read(bs)
 		if nil != err && io.EOF != err {
 			return err
 		}
@@ -60,103 +199,56 @@ func (c *poolConn) recvFull(bs []byte) error {
 	}
 }
 
-func (c *poolConn) putBack() error {
-	if !c.broken {
-		c.lastUsed = time.Now()
-		return c.p.put(c)
-	}
-	return c.close()
-}
+func (pc *poolConn) close() error {
+	pc.m = nil
+	if nil != pc.conn {
+		// TODO: close mysql connection/session
 
-func (c *poolConn) close() error {
-	c.p, c.m = nil, nil
-	if nil != c.conn {
-		return c.conn.Close()
+		conn := pc.conn
+		pc.conn = nil
+		err := conn.Close()
+		// TODO: log the error
+		return err
 	}
 	return nil
 }
 
-type NewConn = func() (net.Conn, error)
-
-type pool struct {
-	ch      chan *poolConn
-	cfg     ClientCfg
-	newConn NewConn
-}
-
-func newPool(cfg *ClientCfg, newConn NewConn) (*pool, error) {
-	if cfg.MaxConns == 0 || cfg.InitialConns > cfg.MaxConns {
-		return nil, errors.New("invalid config")
-	}
-
-	p := &pool{
-		ch:      make(chan *poolConn, cfg.MaxConns),
-		cfg:     *cfg,
-		newConn: newConn,
-	}
-
-	for i := uint(0); i < p.cfg.InitialConns; i++ {
-		conn, err := p.newConn()
-		if nil != err {
-			continue
-		}
-		c, err := newPoolConn(conn, p)
-		if nil != err {
-			continue
-		}
-		p.ch <- c
-	}
-
-	return p, nil
-}
-
-func (p *pool) get() (*poolConn, error) {
-	if nil == p.ch {
-		return nil, errors.New("pool closed")
-	}
-
+func (c *Client) getPoolConn() (*poolConn, error) {
 	for {
 		select {
-		case c := <-p.ch:
-			if time.Now().Sub(c.lastUsed) < p.cfg.IdleTimeout {
-				return c, nil
+		case pc := <-c.pool:
+			if time.Now().Sub(pc.lastUsed) < c.cfg.IdleTimeout {
+				return pc, nil
 			} else {
-				c.close()
+				pc.close()
 			}
 		default:
-			conn, err := p.newConn()
+			pc, err := newPoolConn(&c.cfg)
 			if nil != err {
 				return nil, err
 			}
-			c, err := newPoolConn(conn, p)
-			if nil != err {
-				return nil, err
-			}
-			return c, nil
+			return pc, nil
 		}
 	}
 }
 
-func (p *pool) put(c *poolConn) error {
-	if nil == p.ch {
-		return c.close()
+func (c *Client) putPoolConn(pc *poolConn) error {
+	if pc.broken {
+		return pc.close()
 	}
-
+	pc.lastUsed = time.Now()
 	select {
-	case p.ch <- c:
+	case c.pool <- pc:
 		return nil
 	default:
-		return c.close()
+		return pc.close()
 	}
 }
 
-func (p *pool) Close() {
-	if nil == p.ch {
-		return
+func (c *Client) close() {
+	close(c.pool)
+	for pc := range c.pool {
+		pc.close()
 	}
-	close(p.ch)
-	for c := range p.ch {
-		c.close()
-	}
-	p.ch = nil
+	c.pool = nil
 }

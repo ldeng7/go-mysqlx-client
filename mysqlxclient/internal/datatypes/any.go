@@ -83,6 +83,8 @@ func MysqlScalarFromString(x string) *mysqlxpb_datatypes.Scalar {
 
 func MysqlScalarFromBasic(x interface{}) *mysqlxpb_datatypes.Scalar {
 	switch y := x.(type) {
+	case int:
+		return MysqlScalarFromInt64(int64(y))
 	case int64:
 		return MysqlScalarFromInt64(y)
 	case uint64:

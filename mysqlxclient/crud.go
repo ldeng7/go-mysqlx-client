@@ -132,6 +132,7 @@ func (pc *poolConn) insert(ia *InsertArgs) (uint64, uint64, error) {
 
 func (fa *FindArgs) toMsg() *mysqlxpb_crud.Find {
 	dataModel := mysqlxpb_crud.DataModel_TABLE
+
 	selects := make([]*mysqlxpb_crud.Projection, len(fa.Select))
 	for i, s := range fa.Select {
 		p := &mysqlxpb_crud.Projection{
@@ -143,12 +144,43 @@ func (fa *FindArgs) toMsg() *mysqlxpb_crud.Find {
 		selects[i] = p
 	}
 
+	groups := make([]*mysqlxpb_expr.Expr, len(fa.Groups))
+	for i, g := range fa.Groups {
+		groups[i] = g.toMsg()
+	}
+
+	orders := make([]*mysqlxpb_crud.Order, len(fa.Orders))
+	for i, o := range fa.Orders {
+		om := &mysqlxpb_crud.Order{
+			Expr: o.By.toMsg(),
+		}
+		dir := mysqlxpb_crud.Order_ASC
+		if !o.Asc {
+			dir = mysqlxpb_crud.Order_DESC
+		}
+		om.Direction = &dir
+		orders[i] = om
+	}
+
+	var limitOffset *mysqlxpb_crud.Limit
+	if 0 != fa.Limit || 0 != fa.Offset {
+		limitOffset = &mysqlxpb_crud.Limit{
+			RowCount: &fa.Limit,
+			Offset:   &fa.Offset,
+		}
+	}
+
 	msg := &mysqlxpb_crud.Find{
 		Collection: &mysqlxpb_crud.Collection{
 			Name: &fa.TableName,
 		},
-		DataModel:  &dataModel,
-		Projection: selects,
+		DataModel:        &dataModel,
+		Projection:       selects,
+		Criteria:         fa.Criteria.toMsg(),
+		Grouping:         groups,
+		GroupingCriteria: fa.Having.toMsg(),
+		Order:            orders,
+		Limit:            limitOffset,
 	}
 	return msg
 }

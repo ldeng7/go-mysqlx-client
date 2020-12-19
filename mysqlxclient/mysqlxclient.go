@@ -60,12 +60,6 @@ func NewClient(cfg *ClientCfg) (*Client, error) {
 	return c, nil
 }
 
-type InsertArgs struct {
-	TableName string
-	Columns   []string
-	Values    [][]interface{}
-}
-
 func (c *Client) Insert(ia *InsertArgs) (uint64, uint64, error) {
 	pc, err := c.getPoolConn()
 	if nil != err {
@@ -77,34 +71,6 @@ func (c *Client) Insert(ia *InsertArgs) (uint64, uint64, error) {
 		pc.broken = true
 	}
 	return rows, id, err
-}
-
-type FindSelectItem struct {
-	Expr *Expr
-	As   string
-}
-
-func FindSelectItemsFromColumnNames(columnNames []string) []*FindSelectItem {
-	ar := make([]*FindSelectItem, len(columnNames))
-	for i, n := range columnNames {
-		ar[i] = &FindSelectItem{
-			Expr: &Expr{
-				Type: EXPR_TYPE_COLUMN_NAME,
-				Name: n,
-			},
-		}
-	}
-	return ar
-}
-
-type FindArgs struct {
-	TableName string
-	Select    []*FindSelectItem
-}
-
-type FindResultSet struct {
-	Meta []*ColumnMeta
-	Rows [][]interface{}
 }
 
 func (c *Client) Find(fa *FindArgs) (*FindResultSet, error) {

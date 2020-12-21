@@ -22,7 +22,6 @@ const (
 	EXPR_TYPE_LITERAL       = mysqlxpb_expr.Expr_LITERAL
 	EXPR_TYPE_OPERATOR      = mysqlxpb_expr.Expr_OPERATOR
 	EXPR_TYPE_FUNCTION_CALL = mysqlxpb_expr.Expr_FUNC_CALL
-	EXPR_TYPE_ARRAY         = mysqlxpb_expr.Expr_ARRAY
 )
 
 type Expr struct {
@@ -112,14 +111,6 @@ func (e *Expr) toMsg() *mysqlxpb_expr.Expr {
 			Name:  &e.Name,
 			Param: params,
 		}
-	case EXPR_TYPE_ARRAY:
-		arr := make([]*mysqlxpb_expr.Expr, len(e.Args))
-		for i, a := range e.Args {
-			arr[i] = a.toMsg()
-		}
-		msg.Array = &mysqlxpb_expr.Array{
-			Value: arr,
-		}
 	}
 	return msg
 }
@@ -161,6 +152,13 @@ type Order struct {
 	Asc bool
 }
 
+type Criteria struct {
+	Where  *Expr
+	Orders []Order
+	Limit  uint64
+	Offset uint64
+}
+
 type InsertArgs struct {
 	TableName string
 	Columns   []string
@@ -185,15 +183,23 @@ func FindSelectItemsFromColumnNames(columnNames []string) []*FindSelectItem {
 type FindArgs struct {
 	TableName string
 	Select    []*FindSelectItem
-	Criteria  *Expr
+	Criteria  *Criteria
 	Groups    []*Expr
 	Having    *Expr
-	Orders    []Order
-	Limit     uint64
-	Offset    uint64
 }
 
 type FindResultSet struct {
 	Meta []*ColumnMeta
 	Rows [][]interface{}
+}
+
+type UpdateArgs struct {
+	TableName string
+	Values    map[string]interface{}
+	Criteria  *Criteria
+}
+
+type DeleteArgs struct {
+	TableName string
+	Criteria  *Criteria
 }

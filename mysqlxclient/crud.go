@@ -36,6 +36,45 @@ func mysqlScalarFromColumnData(x interface{}) *mysqlxpb_datatypes.Scalar {
 	}
 }
 
+func (o *Order) toMsg() *mysqlxpb_crud.Order {
+	msg := &mysqlxpb_crud.Order{
+		Expr: o.By.toMsg(),
+	}
+	dir := mysqlxpb_crud.Order_ASC
+	if !o.Asc {
+		dir = mysqlxpb_crud.Order_DESC
+	}
+	msg.Direction = &dir
+	return msg
+}
+
+func (c *Criteria) toMsg() (*mysqlxpb_expr.Expr, []*mysqlxpb_crud.Order, *mysqlxpb_crud.Limit) {
+	orders := make([]*mysqlxpb_crud.Order, len(c.Orders))
+	for i, o := range c.Orders {
+		orders[i] = o.toMsg()
+	}
+
+	var limitOffset *mysqlxpb_crud.Limit
+	if 0 != c.Limit || 0 != c.Offset {
+		limitOffset = &mysqlxpb_crud.Limit{
+			RowCount: &c.Limit,
+			Offset:   &c.Offset,
+		}
+	}
+
+	return c.Where.toMsg(), orders, limitOffset
+}
+
+func (fsi *FindSelectItem) toMsg() *mysqlxpb_crud.Projection {
+	msg := &mysqlxpb_crud.Projection{
+		Source: fsi.Expr.toMsg(),
+	}
+	if 0 != len(fsi.As) {
+		msg.Alias = &fsi.As
+	}
+	return msg
+}
+
 func (ia *InsertArgs) toMsg() *mysqlxpb_crud.Insert {
 	dataModel := mysqlxpb_crud.DataModel_TABLE
 	nCols := len(ia.Columns)
@@ -94,18 +133,15 @@ func (pc *poolConn) insert(ia *InsertArgs) (uint64, uint64, error) {
 		case mysqlxpb.ServerMessages_SQL_STMT_EXECUTE_OK:
 			level++
 		case mysqlxpb.ServerMessages_NOTICE:
-			n, nt := msg.(*mysqlxpb_notice.Frame), mysqlxpb_notice.Frame_SESSION_STATE_CHANGED
-			if mysqlxpb_notice.Frame_Type(n.GetType()) != nt {
-				continue
-			}
-			msg, err = pc.m.parseNotice(nt, n.Payload)
+			n, err := pc.m.parseSessionStateChangedNotice(msg)
 			if nil != err {
 				return 0, 0, err
+			} else if nil == n {
+				continue
 			}
 
-			n1 := msg.(*mysqlxpb_notice.SessionStateChanged)
 			var param *uint64
-			switch n1.GetParam() {
+			switch n.GetParam() {
 			case mysqlxpb_notice.SessionStateChanged_ROWS_AFFECTED:
 				param = &rows
 			case mysqlxpb_notice.SessionStateChanged_GENERATED_INSERT_ID:
@@ -114,15 +150,8 @@ func (pc *poolConn) insert(ia *InsertArgs) (uint64, uint64, error) {
 				continue
 			}
 			level++
-
-			if len(n1.Value) < 1 {
-				return 0, 0, errMysqlInvalidMessage
-			} else if d, err := datatypes.MysqlDataFromScalar(n1.Value[0]); nil != err {
+			if *param, err = pc.m.uint64ValueFromSessionStateChangedNotice(n); nil != err {
 				return 0, 0, err
-			} else if d.Type != datatypes.MYSQL_DATA_TYPE_UINT {
-				return 0, 0, errMysqlInvalidMessage
-			} else {
-				*param = d.Value.(uint64)
 			}
 		}
 	}
@@ -135,13 +164,7 @@ func (fa *FindArgs) toMsg() *mysqlxpb_crud.Find {
 
 	selects := make([]*mysqlxpb_crud.Projection, len(fa.Select))
 	for i, s := range fa.Select {
-		p := &mysqlxpb_crud.Projection{
-			Source: s.Expr.toMsg(),
-		}
-		if 0 != len(s.As) {
-			p.Alias = &s.As
-		}
-		selects[i] = p
+		selects[i] = s.toMsg()
 	}
 
 	groups := make([]*mysqlxpb_expr.Expr, len(fa.Groups))
@@ -149,26 +172,7 @@ func (fa *FindArgs) toMsg() *mysqlxpb_crud.Find {
 		groups[i] = g.toMsg()
 	}
 
-	orders := make([]*mysqlxpb_crud.Order, len(fa.Orders))
-	for i, o := range fa.Orders {
-		om := &mysqlxpb_crud.Order{
-			Expr: o.By.toMsg(),
-		}
-		dir := mysqlxpb_crud.Order_ASC
-		if !o.Asc {
-			dir = mysqlxpb_crud.Order_DESC
-		}
-		om.Direction = &dir
-		orders[i] = om
-	}
-
-	var limitOffset *mysqlxpb_crud.Limit
-	if 0 != fa.Limit || 0 != fa.Offset {
-		limitOffset = &mysqlxpb_crud.Limit{
-			RowCount: &fa.Limit,
-			Offset:   &fa.Offset,
-		}
-	}
+	where, orders, limitOffset := fa.Criteria.toMsg()
 
 	msg := &mysqlxpb_crud.Find{
 		Collection: &mysqlxpb_crud.Collection{
@@ -176,7 +180,7 @@ func (fa *FindArgs) toMsg() *mysqlxpb_crud.Find {
 		},
 		DataModel:        &dataModel,
 		Projection:       selects,
-		Criteria:         fa.Criteria.toMsg(),
+		Criteria:         where,
 		Grouping:         groups,
 		GroupingCriteria: fa.Having.toMsg(),
 		Order:            orders,
@@ -217,4 +221,103 @@ loop:
 		return nil, err
 	}
 	return frs, nil
+}
+
+func (ua *UpdateArgs) toMsg() *mysqlxpb_crud.Update {
+	dataModel := mysqlxpb_crud.DataModel_TABLE
+
+	sets := make([]*mysqlxpb_crud.UpdateOperation, 0, len(ua.Values))
+	setType, exprType := mysqlxpb_crud.UpdateOperation_SET, mysqlxpb_expr.Expr_LITERAL
+	for k, v := range ua.Values {
+		k := k
+		sets = append(sets, &mysqlxpb_crud.UpdateOperation{
+			Operation: &setType,
+			Source: &mysqlxpb_expr.ColumnIdentifier{
+				Name: &k,
+			},
+			Value: &mysqlxpb_expr.Expr{
+				Type:    &exprType,
+				Literal: mysqlScalarFromColumnData(v),
+			},
+		})
+	}
+
+	where, orders, limitOffset := ua.Criteria.toMsg()
+
+	msg := &mysqlxpb_crud.Update{
+		Collection: &mysqlxpb_crud.Collection{
+			Name: &ua.TableName,
+		},
+		DataModel: &dataModel,
+		Operation: sets,
+		Criteria:  where,
+		Order:     orders,
+		Limit:     limitOffset,
+	}
+	return msg
+}
+
+func (pc *poolConn) updateDelete() (uint64, error) {
+	var rows uint64
+	for level := 0; level < 2; {
+		msg, t, err := pc.m.recvMsgUntilTypes(
+			mysqlxpb.ServerMessages_NOTICE,
+			mysqlxpb.ServerMessages_SQL_STMT_EXECUTE_OK,
+		)
+		if nil != err {
+			return 0, err
+		}
+		switch t {
+		case mysqlxpb.ServerMessages_SQL_STMT_EXECUTE_OK:
+			level++
+		case mysqlxpb.ServerMessages_NOTICE:
+			n, err := pc.m.parseSessionStateChangedNotice(msg)
+			if nil != err {
+				return 0, err
+			} else if nil == n {
+				continue
+			}
+
+			if mysqlxpb_notice.SessionStateChanged_ROWS_AFFECTED != n.GetParam() {
+				continue
+			}
+			level++
+			if rows, err = pc.m.uint64ValueFromSessionStateChangedNotice(n); nil != err {
+				return 0, err
+			}
+		}
+	}
+
+	return rows, nil
+}
+
+func (pc *poolConn) update(ua *UpdateArgs) (uint64, error) {
+	if err := pc.m.sendMsg(mysqlxpb.ClientMessages_CRUD_UPDATE, ua.toMsg()); nil != err {
+		return 0, err
+	}
+	return pc.updateDelete()
+}
+
+func (da *DeleteArgs) toMsg() *mysqlxpb_crud.Delete {
+	dataModel := mysqlxpb_crud.DataModel_TABLE
+
+	where, orders, limitOffset := da.Criteria.toMsg()
+
+	msg := &mysqlxpb_crud.Delete{
+		Collection: &mysqlxpb_crud.Collection{
+			Name: &da.TableName,
+		},
+		DataModel: &dataModel,
+		Criteria:  where,
+		Order:     orders,
+		Limit:     limitOffset,
+	}
+	return msg
+}
+
+func (pc *poolConn) delete(da *DeleteArgs) (uint64, error) {
+	if err := pc.m.sendMsg(mysqlxpb.ClientMessages_CRUD_DELETE, da.toMsg()); nil != err {
+		return 0, err
+	}
+	return pc.updateDelete()
 }

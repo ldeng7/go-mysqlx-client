@@ -85,3 +85,29 @@ func (c *Client) Find(fa *FindArgs) (*FindResultSet, error) {
 	}
 	return rs, err
 }
+
+func (c *Client) Update(ua *UpdateArgs) (uint64, error) {
+	pc, err := c.getPoolConn()
+	if nil != err {
+		return 0, err
+	}
+	defer c.putPoolConn(pc)
+	rows, err := pc.update(ua)
+	if nil != err {
+		pc.broken = true
+	}
+	return rows, err
+}
+
+func (c *Client) Delete(da *DeleteArgs) (uint64, error) {
+	pc, err := c.getPoolConn()
+	if nil != err {
+		return 0, err
+	}
+	defer c.putPoolConn(pc)
+	rows, err := pc.delete(da)
+	if nil != err {
+		pc.broken = true
+	}
+	return rows, err
+}

@@ -22,6 +22,44 @@ type messenger struct {
 	pc *poolConn
 }
 
+func (m *messenger) sendFull(bs []byte) error {
+	pc := m.pc
+	for {
+		if timeout := pc.cfg.WriteTimeout; timeout > 0 {
+			if err := pc.conn.SetWriteDeadline(time.Now().Add(timeout)); nil != err {
+				return err
+			}
+		}
+		n, err := pc.conn.Write(bs)
+		if nil != err {
+			return err
+		}
+		if n == len(bs) {
+			return nil
+		}
+		bs = bs[n:]
+	}
+}
+
+func (m *messenger) recvFull(bs []byte) error {
+	pc := m.pc
+	for {
+		if timeout := pc.cfg.ReadTimeout; timeout > 0 {
+			if err := pc.conn.SetReadDeadline(time.Now().Add(timeout)); nil != err {
+				return err
+			}
+		}
+		n, err := pc.conn.Read(bs)
+		if nil != err && io.EOF != err {
+			return err
+		}
+		if n == len(bs) {
+			return nil
+		}
+		bs = bs[n:]
+	}
+}
+
 func (m *messenger) sendMsg(typ mysqlxpb.ClientMessages_Type, msg proto.Message) error {
 	payload, err := proto.Marshal(msg)
 	if nil != err {
@@ -33,18 +71,18 @@ func (m *messenger) sendMsg(typ mysqlxpb.ClientMessages_Type, msg proto.Message)
 	bs[4] = byte(typ)
 	copy(bs[5:], payload)
 
-	return m.pc.sendFull(bs)
+	return m.sendFull(bs)
 }
 
 func (m *messenger) recvPayload() (mysqlxpb.ServerMessages_Type, []byte, error) {
 	bs := make([]byte, 5)
-	if err := m.pc.recvFull(bs); nil != err {
+	if err := m.recvFull(bs); nil != err {
 		return 0, nil, err
 	}
 
 	typ := mysqlxpb.ServerMessages_Type(bs[4])
 	payload := make([]byte, binary.LittleEndian.Uint32(bs)-1)
-	if err := m.pc.recvFull(payload); nil != err {
+	if err := m.recvFull(payload); nil != err {
 		return 0, nil, err
 	}
 
@@ -113,10 +151,6 @@ func (m *messenger) recvMsgUntilTypes(
 			return msg, t, nil
 		}
 		switch t {
-		case mysqlxpb.ServerMessages_NOTICE:
-			if false { // FIXME: for dev only
-				m.printNotice(payload)
-			}
 		case mysqlxpb.ServerMessages_ERROR:
 			msg, err := m.parsePayload(mysqlxpb.ServerMessages_ERROR, payload)
 			if nil != err {
@@ -161,42 +195,6 @@ func newPoolConn(cfg *ClientCfg) (*poolConn, error) {
 		return nil, err
 	}
 	return pc, nil
-}
-
-func (pc *poolConn) sendFull(bs []byte) error {
-	for {
-		if timeout := pc.cfg.WriteTimeout; timeout > 0 {
-			if err := pc.conn.SetWriteDeadline(time.Now().Add(timeout)); nil != err {
-				return err
-			}
-		}
-		n, err := pc.conn.Write(bs)
-		if nil != err {
-			return err
-		}
-		if n == len(bs) {
-			return nil
-		}
-		bs = bs[n:]
-	}
-}
-
-func (pc *poolConn) recvFull(bs []byte) error {
-	for {
-		if timeout := pc.cfg.ReadTimeout; timeout > 0 {
-			if err := pc.conn.SetReadDeadline(time.Now().Add(timeout)); nil != err {
-				return err
-			}
-		}
-		n, err := pc.conn.Read(bs)
-		if nil != err && io.EOF != err {
-			return err
-		}
-		if n == len(bs) {
-			return nil
-		}
-		bs = bs[n:]
-	}
 }
 
 func (pc *poolConn) close() error {

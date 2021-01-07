@@ -88,6 +88,14 @@ func (m *messenger) authenticate(mech string, data []byte, sendStart, recvOk boo
 	return nil, nil
 }
 
+func (m *messenger) close() error {
+	if err := m.sendMsg(mysqlxpb.ClientMessages_CON_CLOSE, &mysqlxpb_connection.Close{}); nil != err {
+		return err
+	}
+	_, _, err := m.recvMsgUntilTypes(mysqlxpb.ServerMessages_OK)
+	return err
+}
+
 type AuthType int
 
 const (

@@ -33,6 +33,7 @@ type ClientCfg struct {
 	WriteTimeout time.Duration
 	IdleTimeout  time.Duration
 	Tls          *tls.Config
+	Log          func(isErr bool, msg string)
 }
 
 func NewClient(cfg *ClientCfg) (*Client, error) {
@@ -41,6 +42,9 @@ func NewClient(cfg *ClientCfg) (*Client, error) {
 	}
 	if 0 == cfg.MaxConns || cfg.InitialConns > cfg.MaxConns {
 		return nil, errors.New("invalid config")
+	}
+	if nil == cfg.Log {
+		cfg.Log = func(isErr bool, msg string) { println(msg) }
 	}
 
 	c := &Client{
@@ -51,7 +55,7 @@ func NewClient(cfg *ClientCfg) (*Client, error) {
 	for i := uint(0); i < cfg.InitialConns; i++ {
 		pc, err := newPoolConn(&c.cfg)
 		if nil != err {
-			println("error on newPoolConn:", err.Error()) // TODO: log the error
+			cfg.Log(true, "error on connecting: "+err.Error())
 			continue
 		}
 		c.pool <- pc
@@ -110,4 +114,12 @@ func (c *Client) Delete(da *DeleteArgs) (uint64, error) {
 		pc.broken = true
 	}
 	return rows, err
+}
+
+func (c *Client) Close() {
+	close(c.pool)
+	for pc := range c.pool {
+		pc.close()
+	}
+	c.pool = nil
 }

@@ -19,18 +19,19 @@ import (
 var errMysqlInvalidMessage = errors.New("invalid data from mysql")
 
 type messenger struct {
-	pc *poolConn
+	pc           *poolConn
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
 }
 
 func (m *messenger) sendFull(bs []byte) error {
-	pc := m.pc
 	for {
-		if timeout := pc.cfg.WriteTimeout; timeout > 0 {
-			if err := pc.conn.SetWriteDeadline(time.Now().Add(timeout)); nil != err {
+		if timeout := m.WriteTimeout; timeout > 0 {
+			if err := m.pc.conn.SetWriteDeadline(time.Now().Add(timeout)); nil != err {
 				return err
 			}
 		}
-		n, err := pc.conn.Write(bs)
+		n, err := m.pc.conn.Write(bs)
 		if nil != err {
 			return err
 		}
@@ -42,14 +43,13 @@ func (m *messenger) sendFull(bs []byte) error {
 }
 
 func (m *messenger) recvFull(bs []byte) error {
-	pc := m.pc
 	for {
-		if timeout := pc.cfg.ReadTimeout; timeout > 0 {
-			if err := pc.conn.SetReadDeadline(time.Now().Add(timeout)); nil != err {
+		if timeout := m.ReadTimeout; timeout > 0 {
+			if err := m.pc.conn.SetReadDeadline(time.Now().Add(timeout)); nil != err {
 				return err
 			}
 		}
-		n, err := pc.conn.Read(bs)
+		n, err := m.pc.conn.Read(bs)
 		if nil != err && io.EOF != err {
 			return err
 		}
@@ -141,7 +141,7 @@ func (m *messenger) recvMsgUntilTypes(
 		if nil != err {
 			return nil, 0, err
 		}
-		//println("recv type", mysqlxpb.ServerMessages_Type_name[int32(t)]) // TODO: log it
+		m.pc.cfg.Log(false, "recv server msg type "+mysqlxpb.ServerMessages_Type_name[int32(t)])
 
 		if ((1 << t) & typeSet) != 0 {
 			msg, err := m.parsePayload(t, payload)
@@ -182,7 +182,9 @@ func newPoolConn(cfg *ClientCfg) (*poolConn, error) {
 	}()
 
 	tc, _ := conn.(*net.TCPConn)
-	tc.SetKeepAlive(true) // TODO: log the error
+	if err := tc.SetKeepAlive(true); nil != err {
+		cfg.Log(true, "error on SetKeepAlive: "+err.Error())
+	}
 	if nil != cfg.OnTCPDial {
 		if err = cfg.OnTCPDial(tc); nil != err {
 			return nil, err
@@ -190,25 +192,26 @@ func newPoolConn(cfg *ClientCfg) (*poolConn, error) {
 	}
 
 	pc := &poolConn{conn: conn, cfg: cfg, lastUsed: time.Now()}
-	pc.m = &messenger{pc}
+	pc.m = &messenger{pc, cfg.ReadTimeout, cfg.WriteTimeout}
 	if err = pc.negotiate(); nil != err {
 		return nil, err
 	}
 	return pc, nil
 }
 
-func (pc *poolConn) close() error {
-	pc.m = nil
-	if nil != pc.conn {
-		// TODO: close mysql connection/session
-
-		conn := pc.conn
-		pc.conn = nil
-		err := conn.Close()
-		// TODO: log the error
-		return err
+func (pc *poolConn) close() {
+	if nil != pc.m {
+		if err := pc.m.close(); nil != err {
+			pc.cfg.Log(true, "error on disconnecting: "+err.Error())
+		}
+		pc.m = nil
 	}
-	return nil
+	if nil != pc.conn {
+		if err := pc.conn.Close(); nil != err {
+			pc.cfg.Log(true, "error on disconnecting: "+err.Error())
+		}
+		pc.conn = nil
+	}
 }
 
 func (c *Client) getPoolConn() (*poolConn, error) {
@@ -221,32 +224,21 @@ func (c *Client) getPoolConn() (*poolConn, error) {
 				pc.close()
 			}
 		default:
-			pc, err := newPoolConn(&c.cfg)
-			if nil != err {
-				return nil, err
-			}
-			return pc, nil
+			return newPoolConn(&c.cfg)
 		}
 	}
 }
 
-func (c *Client) putPoolConn(pc *poolConn) error {
+func (c *Client) putPoolConn(pc *poolConn) {
 	if pc.broken {
-		return pc.close()
+		pc.close()
+		return
 	}
 	pc.lastUsed = time.Now()
 	select {
 	case c.pool <- pc:
-		return nil
+		return
 	default:
-		return pc.close()
-	}
-}
-
-func (c *Client) close() {
-	close(c.pool)
-	for pc := range c.pool {
 		pc.close()
 	}
-	c.pool = nil
 }
